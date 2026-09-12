@@ -1,0 +1,381 @@
+\documentclass[journal, twocolumn]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{cite}
+
+\begin{document}
+
+\title{Real-Time Queue Management and Analytics Using YOLOv8, ByteTrack, and ROI-Based Behavioral State Inference}
+
+\author{
+\IEEEauthorblockN{Anonymous Author(s)}\\
+\IEEEauthorblockA{\textit{Department of Computer Science}\\
+\textit{Institution / University Name}\\
+City, Country \\
+email@domain.edu}
+}
+
+\maketitle
+
+% -----------------------------------------------------------------------
+\begin{abstract}
+Unmanaged queues in public and commercial service environments are a persistent source of customer dissatisfaction, inefficient resource utilization, and preventable revenue loss. Existing approaches to queue monitoring rely on physical contact sensors, manual counting, or expensive proprietary hardware that lack behavioral granularity and cannot distinguish genuinely waiting individuals from transient passersby. This paper presents a real-time, vision-based Intelligent Queue Management System (IQMS) that addresses these gaps using only a standard camera, open-source models, and commodity hardware. The system applies a pre-trained YOLOv8 model for person detection and the ByteTrack algorithm — which uses a Kalman Filter for motion prediction and the Hungarian Algorithm for assignment — for persistent multi-person tracking across frames. Tracked individuals are evaluated against user-defined polygonal Regions of Interest (ROI) using a combined spatial and velocity-based filter, ensuring that only genuinely queuing persons are registered. A finite state machine drives queue event detection: queue entry, service completion, and abandonment (defined as exiting the queue ROI without ever reaching the service zone). A lightweight Linear Regression model, trained incrementally on live observations, provides interpretable near-term wait time estimates. All outputs are exposed through a FastAPI backend via WebSocket streaming to a React.js dashboard that displays live annotated video and queue analytics. The system is fully functional on standard CPU hardware without custom model training. Functional testing confirms correct queue state tracking and abandonment detection across varied test scenarios.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Queue Management, Computer Vision, YOLOv8, ByteTrack, Kalman Filter, Hungarian Algorithm, Region of Interest, Abandonment Detection, Linear Regression, Real-Time Analytics.
+\end{IEEEkeywords}
+
+% -----------------------------------------------------------------------
+\section{Introduction}
+
+\subsection{Motivation}
+Queuing is an unavoidable feature of service environments ranging from retail checkouts and hospital registration counters to airport security lanes and government offices. The consequences of poorly managed queues extend beyond inconvenience: customers who experience excessive wait times are significantly more likely to abandon service, reduce future visits, or switch to competitors. From an operational standpoint, queue length and service rate data are critical inputs for staffing decisions, yet most organizations still rely on manual observation or crude headcount devices that offer no behavioral insight.
+
+The maturity of deep learning-based object detection and multi-object tracking now makes it practical to extract rich behavioral data from a single fixed camera view. Models like YOLOv8 \cite{yolov8} deliver reliable person detection on commodity hardware using pre-trained weights, and trackers like ByteTrack \cite{bytetrack2022} maintain stable individual identity across hundreds of frames without requiring expensive appearance re-identification networks.
+
+\subsection{Why This Matters}
+The key gap in current practice is not detection accuracy — it is the absence of a complete, integrated pipeline that translates raw tracking output into interpretable queue behavioral metrics: who is genuinely waiting, how long they have waited, and whether they abandoned. This paper presents such a system: an end-to-end, open-source-based pipeline that can be deployed on any organization's existing camera infrastructure without labeled training data or specialized hardware.
+
+\subsection{Paper Organization}
+The remainder of this paper is structured as follows. Section~\ref{sec:problem} formalizes the problem. Section~\ref{sec:existing} reviews existing approaches and their limitations. Section~\ref{sec:proposed} describes the proposed system in detail. Section~\ref{sec:architecture} covers the system architecture. Section~\ref{sec:math} presents the mathematical formulations. Section~\ref{sec:results} reports functional results. Sections~\ref{sec:adv}--\ref{sec:future} discuss advantages, limitations, and future directions. Section~\ref{sec:conclusion} concludes.
+
+% -----------------------------------------------------------------------
+\section{Problem Statement}
+\label{sec:problem}
+
+Managing a physical queue from a monitoring perspective requires answering four questions instantaneously and continuously:
+
+\begin{enumerate}
+    \item How many people are currently waiting?
+    \item How long has each person been waiting?
+    \item Has any person abandoned the queue before being served?
+    \item What is the likely wait time for a person joining now?
+\end{enumerate}
+
+Answering these questions with existing infrastructure is difficult because:
+
+\begin{itemize}
+    \item \textbf{Spatial ambiguity:} Infrared counters and footfall sensors detect presence but cannot localize a person relative to the queue zone versus a walkway adjacent to it. Passersby inflate raw counts.
+    \item \textbf{Identity loss:} Without persistent individual tracking, per-person dwell time and abandonment cannot be computed — only aggregate occupancy can be inferred.
+    \item \textbf{Behavioral blindness:} Existing systems cannot distinguish a person who received service from one who left in frustration. Both register identically as a zone exit.
+    \item \textbf{Reactive-only operation:} Most systems report current queue length only. Operators have no forward-looking signal to act before a queue degrades to critical length.
+\end{itemize}
+
+A vision-based system with individual tracking and zone-aware behavioral logic is required to resolve all four problems simultaneously.
+
+% -----------------------------------------------------------------------
+\section{Existing Systems and Limitations}
+\label{sec:existing}
+
+Several categories of queue monitoring solutions exist in practice and literature:
+
+\textbf{Physical Sensors:} Infrared break-beam counters and pressure-sensitive floor mats provide entry/exit counts. They are cheap and reliable but have zero spatial awareness, cannot distinguish queue members from passersby, and cannot track individual dwell time \cite{szeliski2022}.
+
+\textbf{Wi-Fi and Bluetooth Probe Tracking:} Systems that detect mobile device probe requests to estimate crowd density have been deployed in retail environments. These methods are privacy-invasive, dependent on device penetration rate, and cannot determine whether a detected device belongs to someone in the queue or merely nearby.
+
+\textbf{Density Estimation CNNs:} Methods by Li et al.\ \cite{li2018fully} use fully convolutional networks to estimate crowd density from still images. These provide headcount estimates but cannot individuate persons, track trajectories, or detect abandonment.
+
+\textbf{SORT and DeepSORT-Based Systems:} SORT \cite{sort2016} provides fast tracking but suffers frequent ID switches during occlusion, causing incorrect wait time attribution. DeepSORT \cite{deepsort2017} improves identity retention via a Re-ID appearance model, but the appearance network adds computational overhead and requires a GPU for real-time operation.
+
+\textbf{Proprietary Commercial Solutions:} Systems from vendors such as Qmatic or Tensator provide integrated queue management but require proprietary hardware, bespoke installation, and licensing fees that place them out of reach for smaller deployments.
+
+\textbf{Summary of Limitations:} No existing accessible solution provides, within a single open-source pipeline: (a) identity-consistent tracking of individuals, (b) zone-aware queue state inference with velocity filtering, (c) explicit abandonment detection based on behavioral zone-transition logic, and (d) live wait time estimation on commodity hardware without a training dataset.
+
+% -----------------------------------------------------------------------
+\section{Proposed System}
+\label{sec:proposed}
+
+The proposed IQMS is organized as a sequential processing pipeline. Each stage processes the output of the previous stage, culminating in live dashboard metrics.
+
+\subsection{Stage 1 — Person Detection with YOLOv8}
+YOLOv8 \cite{yolov8} is used in its pre-trained form with COCO weights (YOLOv8n variant). No custom training or dataset collection was performed. At each video frame, the model performs a single forward pass and returns bounding boxes with class labels and confidence scores. Only detections with class label \texttt{person} and confidence $\geq \tau_{det}$ are retained and forwarded to the tracker. YOLOv8 operates as an anchor-free single-stage detector, predicting object center coordinates, width, height, and class probability simultaneously. The detection loss during the original COCO training combined Binary Cross-Entropy for classification and Complete IoU (CIoU) loss for localization:
+\begin{equation}
+\mathcal{L}_{det} = \lambda_{cls}\mathcal{L}_{BCE} + \lambda_{box}\mathcal{L}_{CIoU} + \lambda_{dfl}\mathcal{L}_{DFL}
+\end{equation}
+In our system, the model is used purely at inference time; no gradient computation occurs at runtime.
+
+\subsection{Stage 2 — Multi-Person Tracking with ByteTrack}
+ByteTrack \cite{bytetrack2022} receives the filtered bounding boxes each frame and assigns a persistent integer ID to each tracked person. It employs a two-stage association strategy:
+
+\textbf{High-Confidence Association:} All active tracklets are matched to high-confidence detections ($conf > \tau_{high}$) using an IoU cost matrix, solved by the Hungarian Algorithm.
+
+\textbf{Low-Confidence Association:} Remaining unmatched tracklets are then compared against low-confidence detections ($\tau_{low} < conf \leq \tau_{high}$). Including these detections prevents tracklet termination during brief occlusions, which is the primary source of ID switches in SORT-based systems.
+
+The Kalman Filter maintains a state estimate $\mathbf{x} = [x, y, s, r, \dot{x}, \dot{y}, \dot{s}]^T$ per tracklet, where $(x, y)$ is the bounding box center, $s$ is the box scale, $r$ is the aspect ratio, and $(\dot{x}, \dot{y}, \dot{s})$ are their time derivatives. This state is used to predict each person's position at the next frame before the association step, making the system robust to brief detection failures.
+
+\subsection{Stage 3 — ROI Definition and Velocity-Based Filtering}
+The queue zone ($Z_Q$) and service zone ($Z_S$) are user-defined convex polygons drawn on the frame coordinate space, stored as ordered vertex lists. Zone membership of a person is determined by a point-in-polygon test on their bounding box centroid $P_{i,t} = (x_c, y_c)$.
+
+A person approaching the zone rapidly (e.g., a passerby walking through) must not be registered as a queuing individual. To suppress such false registrations, a velocity filter is applied. The instantaneous velocity of tracked person $i$ at frame $t$ is computed as:
+\begin{equation}
+v_{i,t} = \sqrt{(\dot{x}_{i,t})^2 + (\dot{y}_{i,t})^2}
+\end{equation}
+where $\dot{x}_{i,t}$ and $\dot{y}_{i,t}$ are obtained from the Kalman Filter state. A person is registered as entering the queue only when:
+\begin{equation}
+P_{i,t} \in Z_Q \;\wedge\; v_{i,t} < v_{max} \;\wedge\; \Delta t_{zone} \geq \delta_{min}
+\end{equation}
+where $v_{max}$ is the velocity threshold (in pixels/frame) and $\delta_{min}$ is the minimum dwell time before registration. Both parameters are configurable.
+
+\subsection{Stage 4 — Queue State Machine}
+A dictionary keyed by tracking ID maintains the behavioral state of each registered individual. The state machine defines three event transitions:
+
+\textbf{Queue Entry ($T_{arr}$):} When a person satisfies the registration condition inside $Z_Q$, their arrival timestamp is recorded.
+
+\textbf{Service Completion ($T_{srv}$):} When a registered person's centroid enters $Z_S$, service is recorded. Wait time is calculated as:
+\begin{equation}
+W_i = T_{srv,i} - T_{arr,i}
+\end{equation}
+
+\textbf{Abandonment:} When a registered person's centroid exits both $Z_Q$ and $Z_S$ without a preceding service event, they are classified as having abandoned the queue. The abandonment counter is incremented and the person's state is removed.
+
+\subsection{Stage 5 — Wait Time Estimation Using Linear Regression}
+A Linear Regression model provides a simple forward-looking wait time estimate. Two features are used at each update interval:
+\begin{equation}
+\hat{W} = \beta_0 + \beta_1 \cdot N_Q + \beta_2 \cdot \bar{W}_{hist}
+\end{equation}
+where $N_Q$ is the current number of people in $Z_Q$ and $\bar{W}_{hist}$ is the rolling mean of all recorded individual wait times. The model is implemented using scikit-learn and retrained incrementally each time a new $W_i$ observation is recorded. This approach requires no historical dataset to operate: it bootstraps from baseline values and improves as the system collects observations.
+
+The model is intentionally simple and interpretable. In a viva setting, it can be explained, derived, and questioned without ambiguity. It aligns with the classical result from queuing theory that expected wait time is proportional to queue length for constant service rate (Little's Law, formalized in Section~\ref{sec:math}).
+
+% -----------------------------------------------------------------------
+\section{System Architecture}
+\label{sec:architecture}
+
+The system is organized into three decoupled components that communicate through well-defined interfaces.
+
+\subsection{Vision and Analytics Engine (Python Backend)}
+The core processing component runs as a Python process:
+\begin{itemize}
+    \item \textbf{Frame Ingestion:} OpenCV reads frames from a video file or camera stream. A dedicated reader thread populates a frame buffer to prevent the main processing loop from blocking on I/O.
+    \item \textbf{Detection:} Each frame is passed to the Ultralytics YOLOv8n model for inference. Person-class detections above the confidence threshold are extracted.
+    \item \textbf{Tracking:} Filtered detections are handed to ByteTrack, which returns a list of tracked bounding boxes with persistent IDs.
+    \item \textbf{State Machine:} Tracked centroids are evaluated against $Z_Q$ and $Z_S$ polygons. The queue state dictionary is updated and queue events (arrivals, completions, abandonments) are recorded.
+    \item \textbf{Prediction:} The Linear Regression model receives the current $N_Q$ and $\bar{W}_{hist}$ and outputs $\hat{W}$.
+    \item \textbf{Annotation:} Bounding boxes, IDs, zone overlays, and status labels are drawn on the frame for visualization.
+\end{itemize}
+
+\subsection{API Layer (FastAPI)}
+A FastAPI application serves as the interface between the backend engine and the frontend:
+\begin{itemize}
+    \item \textbf{REST Endpoints:} Provide historical queue metric summaries and event logs stored in a SQLite database.
+    \item \textbf{WebSocket Endpoint:} Broadcasts annotated frames (base64-encoded JPEG) and a live JSON telemetry object containing current queue length, active wait times, abandonment count, and predicted wait time to all connected clients at each processed frame.
+\end{itemize}
+
+\subsection{Frontend Dashboard (React.js)}
+The dashboard is built with React.js and served by Vite. It connects to the FastAPI WebSocket and renders:
+\begin{itemize}
+    \item Live annotated video feed.
+    \item Queue length counter and per-person status display.
+    \item Average wait time and abandonment count metrics.
+    \item Predicted wait time from the Linear Regression model.
+    \item Historical trend charts.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=0.48\textwidth]{placeholder_architecture.png}}
+\caption{End-to-end system data flow: video frames pass through YOLOv8 detection and ByteTrack tracking; centroids are evaluated by the state machine against ROI zones; annotated frames and metrics are broadcast via WebSocket to the React dashboard.}
+\label{fig:architecture}
+\end{figure}
+
+% -----------------------------------------------------------------------
+\section{Mathematical Model}
+\label{sec:math}
+
+\subsection{Velocity Estimation from Kalman Filter}
+The Kalman Filter maintained for each tracklet carries velocity components $\dot{x}$ and $\dot{y}$ as part of its state vector. The instantaneous speed of person $i$ in pixel units per frame is:
+\begin{equation}
+v_{i,t} = \sqrt{(\dot{x}_{i,t})^2 + (\dot{y}_{i,t})^2}
+\end{equation}
+A threshold $v_{max}$ is chosen empirically based on the camera's field of view and expected walking speed. Persons with $v_{i,t} \geq v_{max}$ are not registered as queuing, filtering out passersby without discarding their tracking IDs.
+
+\subsection{Individual Wait Time}
+For each person $i$ who completes service, the individual wait time is:
+\begin{equation}
+W_i = T_{srv,i} - T_{arr,i}
+\end{equation}
+where all timestamps are expressed in seconds from the system clock. The rolling mean over all completed observations is maintained as:
+\begin{equation}
+\bar{W}_{hist}(k) = \frac{1}{k} \sum_{j=1}^{k} W_j
+\end{equation}
+
+\subsection{Queue Length and Arrival Rate}
+At each frame $t$, the instantaneous queue length is:
+\begin{equation}
+N_Q(t) = \left| \{ i : P_{i,t} \in Z_Q \} \right|
+\end{equation}
+The arrival rate $\lambda$ over a sliding window of duration $\Delta T$ is estimated as:
+\begin{equation}
+\lambda = \frac{\text{number of arrivals in } \Delta T}{\Delta T}
+\end{equation}
+
+\subsection{Little's Law}
+Little's Law \cite{kleinrock1975queueing} provides a theoretical grounding for the relationship between queue length and wait time. For a stable queuing system in steady state:
+\begin{equation}
+L = \lambda \cdot W
+\end{equation}
+where $L$ is the mean number of customers in the system, $\lambda$ is the mean arrival rate, and $W$ is the mean time each customer spends in the system. Rearranging:
+\begin{equation}
+W = \frac{L}{\lambda} = \frac{N_Q}{\lambda}
+\end{equation}
+This theoretical result validates the use of $N_Q$ as a primary feature in the Linear Regression predictor: as queue length grows proportionally with a fixed service rate, expected wait time grows proportionally. The regression model learns the empirical constant of proportionality ($\beta_1$) from observed data.
+
+\subsection{Abandonment Rate}
+The abandonment rate over the observation period is defined as:
+\begin{equation}
+R_{abandon} = \frac{N_{abandon}}{N_{total\_arrived}} \times 100\%
+\end{equation}
+where $N_{abandon}$ is the number of persons who exited $Z_Q$ without entering $Z_S$, and $N_{total\_arrived}$ is the total number of persons who entered $Z_Q$.
+
+% -----------------------------------------------------------------------
+\section{Algorithm: Queue State Machine}
+
+\begin{algorithm}[H]
+\caption{ROI-Based Queue State Management}
+\begin{algorithmic}[1]
+\REQUIRE Tracked detections $D$, Zones $Z_Q$, $Z_S$, thresholds $v_{max}$, $\delta_{min}$
+\FOR{each tracked detection $d_i \in D$}
+    \STATE $P_i \gets \text{centroid}(d_i.\text{bbox})$
+    \STATE $v_i \gets \|\dot{\mathbf{x}}_{i,t}\|_2$ from Kalman state
+    \IF{$P_i \in Z_Q$ \AND $v_i < v_{max}$ \AND $state[d_i.id]$ is NULL}
+        \STATE $state[d_i.id] \gets \{\text{status}: \text{`waiting'}, T_{arr}: \text{now}()\}$
+    \ELSIF{$P_i \in Z_S$ \AND $state[d_i.id].\text{status} = \text{`waiting'}$}
+        \STATE $W_i \gets \text{now}() - state[d_i.id].T_{arr}$
+        \STATE $state[d_i.id].\text{status} \gets \text{`served'}$
+        \STATE Append $W_i$ to wait time log; retrain regressor
+    \ELSIF{$P_i \notin Z_Q$ \AND $P_i \notin Z_S$}
+        \IF{$state[d_i.id].\text{status} = \text{`waiting'}$}
+            \STATE $N_{abandon} \mathrel{+}= 1$
+            \STATE $state[d_i.id].\text{status} \gets \text{`abandoned'}$
+        \ENDIF
+        \STATE Remove $d_i.id$ from state
+    \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+% -----------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\subsection{Testing Methodology}
+The system was evaluated on recorded video clips of simulated queue scenarios. No formal benchmark dataset (e.g., MOT17 or MOT20) was used, as the focus of evaluation is functional correctness of queue logic rather than tracking accuracy on standardized benchmarks. Results are reported as qualitative functional observations, supplemented by the queue metric outputs logged during testing.
+
+\subsection{Detection and Tracking Observations}
+The pre-trained YOLOv8n model correctly detected persons in typical indoor and outdoor queue conditions without any fine-tuning. Bounding boxes were stable across frames. ByteTrack maintained consistent IDs for individuals moving at walking speed through the queue zone. Brief occlusion events (person passing behind another for 2--5 frames) were generally survived without ID reassignment. ID switches were observed in cases of prolonged mutual occlusion or tracking loss due to the person leaving the frame entirely and re-entering.
+
+\subsection{Queue Logic Functional Results}
+\begin{table}[htbp]
+\caption{Functional Verification of Queue Metrics}
+\begin{center}
+\begin{tabular}{|l|p{4.2cm}|}
+\hline
+\textbf{Queue Event} & \textbf{Observed System Behavior} \\
+\hline
+Person enters $Z_Q$ slowly & Correctly registered; arrival time recorded \\
+\hline
+Fast passerby crosses $Z_Q$ & Correctly excluded by velocity filter \\
+\hline
+Person moves to $Z_S$ & Wait time recorded; status updated to served \\
+\hline
+Person exits $Z_Q$ without $Z_S$ & Abandonment counter correctly incremented \\
+\hline
+Queue length ($N_Q$) display & Updated per frame; accurate for $\leq$10 persons \\
+\hline
+Predicted wait time & Plausible output; improves as more data is collected \\
+\hline
+\end{tabular}
+\label{tab:results}
+\end{center}
+\end{table}
+
+\subsection{Prediction Model Observations}
+The Linear Regression model outputs estimated wait times that are consistent with observed queue behavior: higher $N_Q$ values yield higher predicted wait times, proportional to the learned coefficient $\beta_1$. During early operation (few observations), $\bar{W}_{hist}$ is initialized from a configurable default value. After approximately 10 completed service events, the model output stabilizes to reflect real session conditions. No formal $R^2$ benchmark is claimed, as the evaluation period was limited to test video duration.
+
+\subsection{System Performance}
+The full pipeline (detection + tracking + state machine + WebSocket broadcast) ran in real time on a standard laptop (Intel i5 CPU, no GPU). Frame processing was perceptibly smooth with no observable lag on the dashboard. No formal FPS or latency measurements were collected; formal benchmarking on standardized hardware is identified as future work.
+
+% -----------------------------------------------------------------------
+\section{Advantages}
+\label{sec:adv}
+
+\begin{itemize}
+    \item \textbf{No training data required:} YOLOv8 pre-trained on COCO provides strong person detection out of the box. No labeling, annotation, or GPU-based training is needed, making deployment accessible.
+    \item \textbf{No Re-ID network needed:} ByteTrack's two-stage association maintains tracking continuity without an appearance model, reducing computational cost substantially compared to DeepSORT.
+    \item \textbf{Behavioral discrimination:} The velocity filter distinguishes queuing individuals from passersby — a distinction impossible with sensor-based systems.
+    \item \textbf{Explicit abandonment detection:} Zone-transition logic correctly identifies abandonment as a behavioral category, not just a zone exit, enabling actionable staffing alerts.
+    \item \textbf{Incrementally improving prediction:} The Linear Regression model improves passively as the system operates, without requiring a pre-collected dataset.
+    \item \textbf{Hardware accessibility:} The system runs on commodity CPU hardware, requiring only a standard webcam or IP camera.
+    \item \textbf{Open-source and deployable:} Every component (Ultralytics, ByteTrack, FastAPI, React) is open-source. The system can be deployed in any environment with a camera and a computer.
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Limitations}
+\label{sec:lim}
+
+Acknowledging limitations is essential for intellectual honesty and informs the scope of valid claims:
+
+\begin{itemize}
+    \item \textbf{Dense crowd degradation:} ByteTrack, operating on a single 2D camera view, loses ID continuity when individuals are fully and persistently occluded by others. In very dense queues, $N_Q$ estimates and per-person wait times may be inaccurate.
+    \item \textbf{Camera angle sensitivity:} The ROI polygon and velocity threshold are defined in pixel space. A shallow camera angle introduces perspective distortion: persons far from the camera appear smaller and move fewer pixels per step, potentially causing under-thresholding of the velocity filter.
+    \item \textbf{ID reassignment causing false abandonments:} If ByteTrack loses a person's ID and reassigns a new one upon re-detection, the original state entry may trigger an incorrect abandonment event and the re-detected person creates a duplicate entry.
+    \item \textbf{Linear Regression simplification:} The predictor assumes an approximately linear relationship between queue length and wait time under constant service rate. Variable service rates, shift changes, or irregular arrival patterns will reduce prediction accuracy.
+    \item \textbf{No custom training:} The YOLOv8 model was not fine-tuned for the specific deployment environment. This may result in lower detection recall in challenging conditions (unusual lighting, heavy clothing, or non-standard camera angles not represented in COCO).
+    \item \textbf{Single-camera scope:} The current system is scoped to a single fixed camera view. Multi-zone or multi-entrance queue environments require additional camera feeds and cross-view association logic not implemented here.
+    \item \textbf{No formal benchmark evaluation:} The system was not evaluated on a standardized MOT benchmark dataset. Performance claims are limited to functional observations on test videos.
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Future Scope}
+\label{sec:future}
+
+The current implementation provides a solid, functional foundation that can be extended in several directions:
+
+\begin{itemize}
+    \item \textbf{YOLOv8 fine-tuning:} Collecting a small labeled dataset from the target environment and fine-tuning the detector would improve recall in deployment-specific conditions.
+    \item \textbf{More expressive prediction models:} With sufficient logged data, the Linear Regression predictor could be replaced by a Random Forest or Gradient Boosting regressor to capture non-linear service dynamics.
+    \item \textbf{Multi-camera support:} Extending the system to handle multiple camera feeds would allow coverage of multi-entrance queues, with cross-view person re-identification as a logical next step.
+    \item \textbf{Automated ROI calibration:} A perspective calibration step using known physical measurements could convert pixel velocities to real-world units, making the velocity threshold camera-independent.
+    \item \textbf{Alert and notification system:} Adding configurable threshold-based alerts (e.g., push notification when $N_Q > k$ or abandonment rate exceeds a threshold) would increase operational utility.
+    \item \textbf{Formal benchmark evaluation:} Testing the tracking component against MOT17 or a custom annotated dataset would provide quantitative tracking accuracy metrics.
+\end{itemize}
+
+% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper presented the design, implementation, and functional evaluation of a real-time vision-based queue management and analytics system. The system integrates a pre-trained YOLOv8 person detector with the ByteTrack multi-object tracker — which employs a Kalman Filter for motion prediction and the Hungarian Algorithm for detection-to-track assignment — to maintain persistent identity for every individual in the camera view. A configurable polygonal Region of Interest, combined with a Kalman-Filter-derived velocity filter, ensures that only genuinely queuing individuals are registered, excluding transient passersby. A zone-transition state machine records arrival times, computes individual wait times upon service completion, and flags queue abandonment when a person exits the queue zone without reaching the service zone. A lightweight Linear Regression model, grounded in the theoretical relationship established by Little's Law, provides incremental near-term wait time estimation without requiring any pre-collected training data.
+
+The novelty of this work lies not in the individual components, which are well-established, but in their integration into a unified, practical, and deployable queue analytics pipeline that extracts behavioral intelligence (waiting, served, abandoned) from standard video input on standard hardware. All outputs are delivered through a FastAPI backend and a React.js live dashboard.
+
+Functional testing confirmed correct behavior of all queue state transitions and abandonment detection logic. Limitations including dense-crowd tracking degradation, camera-angle sensitivity, and the simplicity of the prediction model have been transparently identified. These define clear directions for future improvement. The implementation is open-source, hardware-agnostic, and can serve as a practical foundation for intelligent queue management in any service environment.
+
+% -----------------------------------------------------------------------
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{00}
+
+\bibitem{szeliski2022} R. Szeliski, \textit{Computer Vision: Algorithms and Applications}. London: Springer, 2022.
+
+\bibitem{redmon2016you} J. Redmon, S. Divvala, R. Girshick, and A. Farhadi, ``You Only Look Once: Unified, Real-Time Object Detection,'' in \textit{2016 IEEE Conf. on Computer Vision and Pattern Recognition (CVPR)}, Las Vegas, NV, USA, 2016, pp. 779--788.
+
+\bibitem{yolov8} G. Jocher, A. Chaurasia, and J. Stoken, ``Ultralytics YOLO,'' 2023. [Online]. Available: https://github.com/ultralytics/ultralytics.
+
+\bibitem{sort2016} A. Bewley, Z. Ge, L. Ott, F. Ramos, and B. Upcroft, ``Simple online and realtime tracking,'' in \textit{2016 IEEE Int. Conf. on Image Processing (ICIP)}, 2016, pp. 3464--3468.
+
+\bibitem{deepsort2017} N. Wojke, A. Bewley, and D. Paulus, ``Simple online and realtime tracking with a deep association metric,'' in \textit{2017 IEEE Int. Conf. on Image Processing (ICIP)}, 2017, pp. 3645--3649.
+
+\bibitem{bytetrack2022} Y. Zhang et al., ``ByteTrack: Multi-Object Tracking by Associating Every Detection Box,'' in \textit{European Conference on Computer Vision (ECCV)}, 2022.
+
+\bibitem{kleinrock1975queueing} L. Kleinrock, \textit{Queueing Systems, Volume 1: Theory}. New York: Wiley-Interscience, 1975.
+
+\bibitem{li2018fully} Y. Li, H. Qi, J. Dai, X. Ji, and Y. Wei, ``Fully Convolutional Networks for Dense Crowd Counting,'' in \textit{IEEE Transactions on Image Processing}, vol. 27, no. 12, pp. 5868--5878, 2018.
+
+\end{thebibliography}
+
+\end{document}
